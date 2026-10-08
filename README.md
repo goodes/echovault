@@ -370,7 +370,7 @@ Keybindings:
 | Claude Code | `memory setup claude-code` | MCP server plus refreshed task-aware skill; `.mcp.json` (project) or `~/.claude.json` (global) |
 | Cursor | `memory setup cursor` | MCP server in `.cursor/mcp.json` |
 | Codex | `memory setup codex` | MCP server in `.codex/config.toml` + `AGENTS.md` fallback |
-| OpenCode | `memory setup opencode` | MCP server in `opencode.json` (project) or `~/.config/opencode/opencode.json` (global) |
+| OpenCode | `memory setup opencode` | MCP server in `opencode.json` (project) or `~/.config/opencode/opencode.json` (global). The OpenCode 1 or 2 config schema is detected; override with `--opencode-version {1,2}` |
 
 All agents share the same memory vault at your effective `memory_home` path (default `~/.memory/`). A memory saved by Claude Code is searchable from Cursor, Codex, or OpenCode.
 

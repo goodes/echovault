@@ -266,8 +266,14 @@ class TestCodexSetup:
         assert result["status"] == "ok"
 
 
+@pytest.fixture
+def no_opencode_binary(monkeypatch):
+    """Keep schema detection independent of any locally installed OpenCode."""
+    monkeypatch.setattr("memory.setup._opencode_major_version", lambda: None)
+
+
 class TestOpenCodeSetup:
-    def test_creates_opencode_json_with_mcp(self, tmp_path, monkeypatch):
+    def test_creates_opencode_json_with_mcp(self, tmp_path, monkeypatch, no_opencode_binary):
         from memory.setup import setup_opencode
         monkeypatch.chdir(tmp_path)
         result = setup_opencode(project=True)
@@ -275,9 +281,9 @@ class TestOpenCodeSetup:
         path = tmp_path / "opencode.json"
         assert path.exists()
         data = json.loads(path.read_text())
-        assert "mcp" in data
-        assert "echovault" in data["mcp"]
-        cfg = data["mcp"]["echovault"]
+        # A fresh config targets OpenCode 2, which nests servers under mcp.servers.
+        assert "echovault" in data["mcp"]["servers"]
+        cfg = data["mcp"]["servers"]["echovault"]
         assert cfg["type"] == "local"
         assert cfg["command"] == ["memory", "mcp"]
 
@@ -326,7 +332,7 @@ class TestOpenCodeSetup:
         result = uninstall_opencode(project=True)
         assert result["message"] == "Nothing to remove"
 
-    def test_global_path(self, tmp_path, monkeypatch):
+    def test_global_path(self, tmp_path, monkeypatch, no_opencode_binary):
         from memory.setup import setup_opencode
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path) if p == "~" else p)
         result = setup_opencode(project=False)
@@ -334,7 +340,156 @@ class TestOpenCodeSetup:
         path = tmp_path / ".config" / "opencode" / "opencode.json"
         assert path.exists()
         data = json.loads(path.read_text())
+        assert "echovault" in data["mcp"]["servers"]
+
+
+class TestOpenCodeSchemaSelection:
+    """OpenCode 1 keys servers off `mcp`; OpenCode 2 nests them under `mcp.servers`."""
+
+    def test_existing_v1_config_keeps_v1_shape(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        existing = {"mcp": {"other-tool": {"type": "local", "command": ["other"]}}}
+        (tmp_path / "opencode.json").write_text(json.dumps(existing))
+        result = setup_opencode(project=True)
+        assert "OpenCode 1 schema" in result["message"]
+        data = json.loads((tmp_path / "opencode.json").read_text())
         assert "echovault" in data["mcp"]
+        assert "servers" not in data["mcp"]
+        assert "other-tool" in data["mcp"]
+
+    def test_existing_v2_config_keeps_v2_shape(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        existing = {"mcp": {"servers": {"other": {"type": "local", "command": ["x"]}}}}
+        (tmp_path / "opencode.json").write_text(json.dumps(existing))
+        result = setup_opencode(project=True)
+        assert "OpenCode 2 schema" in result["message"]
+        data = json.loads((tmp_path / "opencode.json").read_text())
+        assert "echovault" in data["mcp"]["servers"]
+        assert "other" in data["mcp"]["servers"]
+
+    def test_explicit_version_overrides_detection(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        existing = {"mcp": {"other-tool": {"type": "local", "command": ["other"]}}}
+        (tmp_path / "opencode.json").write_text(json.dumps(existing))
+        result = setup_opencode(project=True, opencode_version=2)
+        assert "OpenCode 2 schema" in result["message"]
+        data = json.loads((tmp_path / "opencode.json").read_text())
+        assert "echovault" in data["mcp"]["servers"]
+
+    def test_falls_back_to_installed_binary_version(self, tmp_path, monkeypatch):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("memory.setup._opencode_major_version", lambda: 1)
+        result = setup_opencode(project=True)
+        assert "OpenCode 1 schema" in result["message"]
+        data = json.loads((tmp_path / "opencode.json").read_text())
+        assert "echovault" in data["mcp"]
+
+    def test_uninstall_handles_v1_shape(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode, uninstall_opencode
+        monkeypatch.chdir(tmp_path)
+        setup_opencode(project=True, opencode_version=1)
+        assert uninstall_opencode(project=True)["status"] == "ok"
+        assert not (tmp_path / "opencode.json").exists()
+
+    def test_uninstall_handles_v2_shape(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode, uninstall_opencode
+        monkeypatch.chdir(tmp_path)
+        setup_opencode(project=True, opencode_version=2)
+        assert "Removed" in uninstall_opencode(project=True)["message"]
+        assert not (tmp_path / "opencode.json").exists()
+
+    def test_idempotent_in_v2_shape(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        setup_opencode(project=True, opencode_version=2)
+        assert setup_opencode(project=True)["message"] == "Already installed"
+
+
+class TestConfigIsNeverDestroyed:
+    """A config that cannot be parsed must not be replaced.
+
+    `_read_json` previously swallowed JSONDecodeError and returned {}, so an
+    install rebuilt the file from nothing and discarded everything in it.
+    """
+
+    JSONC = """{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  // servers I configured myself
+  "mcp": {
+    "servers": {
+      "github": {
+        "type": "local",
+        "command": ["npx", "-y", "server-github"],
+      },
+    },
+  },
+}
+"""
+
+    def test_jsonc_config_is_parsed_and_preserved(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "opencode.json").write_text(self.JSONC, encoding="utf-8")
+        result = setup_opencode(project=True)
+        assert result["status"] == "ok"
+        data = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
+        assert data["theme"] == "tokyonight"
+        assert data["$schema"] == "https://opencode.ai/config.json"
+        assert "github" in data["mcp"]["servers"]
+        assert "echovault" in data["mcp"]["servers"]
+
+    def test_overwriting_leaves_a_backup(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "opencode.json").write_text(self.JSONC, encoding="utf-8")
+        setup_opencode(project=True)
+        backup = tmp_path / "opencode.json.bak"
+        assert backup.exists()
+        # The backup keeps the original byte-for-byte, comments included.
+        assert backup.read_text(encoding="utf-8") == self.JSONC
+
+    def test_unparseable_config_is_left_alone(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        garbage = '{ "theme": "dark", this is not valid '
+        (tmp_path / "opencode.json").write_text(garbage, encoding="utf-8")
+        result = setup_opencode(project=True)
+        assert result["status"] == "error"
+        assert "left untouched" in result["message"]
+        assert (tmp_path / "opencode.json").read_text(encoding="utf-8") == garbage
+
+    def test_unparseable_claude_config_is_left_alone(self, tmp_path):
+        """The guard covers every agent, not just OpenCode."""
+        from memory.setup import setup_claude_code
+        garbage = "{ not json "
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(garbage, encoding="utf-8")
+        result = setup_claude_code(str(tmp_path / ".claude"), project=True)
+        assert result["status"] == "error"
+        assert mcp_path.read_text(encoding="utf-8") == garbage
+
+    def test_dropped_comments_are_reported(self, tmp_path, monkeypatch, no_opencode_binary):
+        """Rewriting JSONC as JSON loses comments; say so rather than hide it."""
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "opencode.json").write_text(self.JSONC, encoding="utf-8")
+        result = setup_opencode(project=True)
+        assert "comments" in result["message"]
+        assert "opencode.json.bak" in result["message"]
+
+    def test_plain_json_config_reports_no_comment_loss(self, tmp_path, monkeypatch, no_opencode_binary):
+        from memory.setup import setup_opencode
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "opencode.json").write_text(
+            json.dumps({"mcp": {"servers": {}}}), encoding="utf-8"
+        )
+        result = setup_opencode(project=True)
+        assert "comments" not in result["message"]
 
 
 class TestCodexTomlMcp:
@@ -452,3 +607,4 @@ class TestUninstall:
         from memory.setup import uninstall_claude_code
         result = uninstall_claude_code(str(claude_home), project=True)
         assert result["status"] == "ok"
+

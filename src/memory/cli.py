@@ -730,6 +730,8 @@ def _setup_agent(agent: str, *, project: bool) -> dict[str, str]:
 
 def _finish_setup(agent: str, result: dict[str, str]) -> None:
     """Print a consistent setup result and activation hint."""
+    if result.get("status") == "error":
+        raise click.ClickException(result["message"])
     home, created = _initialize_vault()
     if created:
         click.echo(f"Initialized memory vault at {home}")
@@ -813,11 +815,20 @@ def setup_codex_cmd(config_dir, project):
 
 @setup.command("opencode")
 @click.option("--project", is_flag=True, default=False, help="Install in current project instead of globally")
-def setup_opencode_cmd(project):
+@click.option(
+    "--opencode-version",
+    type=click.Choice(["1", "2"]),
+    default=None,
+    help="Force the OpenCode config schema instead of detecting it",
+)
+def setup_opencode_cmd(project, opencode_version):
     """Set up EchoVault for OpenCode."""
     from memory.setup import setup_opencode
 
-    result = setup_opencode(project=project)
+    result = setup_opencode(
+        project=project,
+        opencode_version=int(opencode_version) if opencode_version else None,
+    )
     _finish_setup("opencode", result)
 
 

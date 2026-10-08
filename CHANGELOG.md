@@ -6,7 +6,13 @@ The format is inspired by Keep a Changelog and follows semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+- `memory setup` no longer destroys an agent config it cannot parse. `_read_json` treated an unparseable file as empty, so the install rebuilt it from nothing and discarded everything the user had configured. Agent configs are now also read as JSONC (comments and trailing commas), which is what OpenCode's own documented config uses and the reason its config was being wiped. A config that still cannot be parsed is left untouched and reported as an error.
+- `memory setup opencode` now writes the schema matching the installed OpenCode generation. OpenCode 2 nests servers under `mcp.servers`, while only `mcp.<name>` was ever written, so the entry was not read on OpenCode 2.
+
 ### Added
+- Added OpenCode schema detection: the shape of an existing config decides, falling back to `opencode --version` and then to the current generation. `memory setup opencode --opencode-version {1,2}` forces one.
+- `memory setup` now keeps a `.bak` of any config file it rewrites.
 - Added a curl-friendly POSIX installer that prefers `uv` or `pipx`, falls back to an isolated virtual environment, and can configure a selected agent and project scope in one command.
 - Added guided `memory setup` with installed-agent detection.
 

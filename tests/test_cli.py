@@ -1080,6 +1080,8 @@ def test_uninstall_claude_code_project_flag(env_home, tmp_path, monkeypatch):
 def test_setup_opencode_project_flag(env_home, tmp_path, monkeypatch):
     """Test that --project installs opencode.json in cwd."""
     monkeypatch.chdir(tmp_path)
+    # Do not let a locally installed OpenCode decide the schema under test.
+    monkeypatch.setattr("memory.setup._opencode_major_version", lambda: None)
 
     runner = CliRunner()
     result = runner.invoke(main, ["setup", "opencode", "--project"])
@@ -1089,9 +1091,27 @@ def test_setup_opencode_project_flag(env_home, tmp_path, monkeypatch):
     assert opencode_path.exists()
     import json
     data = json.loads(opencode_path.read_text())
-    assert "echovault" in data["mcp"]
+    # A fresh config targets OpenCode 2, which nests servers under mcp.servers.
+    servers = data["mcp"]["servers"]
+    assert servers["echovault"]["type"] == "local"
+    assert servers["echovault"]["command"] == ["memory", "mcp"]
+
+
+def test_setup_opencode_version_override(env_home, tmp_path, monkeypatch):
+    """--opencode-version 1 forces the OpenCode 1 schema."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("memory.setup._opencode_major_version", lambda: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["setup", "opencode", "--project", "--opencode-version", "1"]
+    )
+
+    assert result.exit_code == 0
+    import json
+    data = json.loads((tmp_path / "opencode.json").read_text())
     assert data["mcp"]["echovault"]["type"] == "local"
-    assert data["mcp"]["echovault"]["command"] == ["memory", "mcp"]
+    assert "servers" not in data["mcp"]
 
 
 def test_uninstall_opencode_project_flag(env_home, tmp_path, monkeypatch):

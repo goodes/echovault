@@ -1,29 +1,138 @@
 """Agent setup — installs hooks, skills, and configuration for supported agents."""
 
+import functools
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
-from typing import Any
+from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------------------------
 
-def _read_json(path: str) -> dict:
-    """Read a JSON file, returning empty dict if missing or empty."""
+class ConfigParseError(Exception):
+    """An existing agent config could not be parsed.
+
+    Raised instead of returning an empty dict, because callers merge their own
+    entry into whatever was read and write the result back. Treating an
+    unreadable config as empty silently replaced the user's entire file.
+    """
+
+    def __init__(self, path: str):
+        super().__init__(
+            f"Could not parse {path}, so it was left untouched rather than "
+            f"discarding your configuration. Fix the file's syntax (or move it "
+            f"aside) and run this command again."
+        )
+        self.path = path
+
+
+def _guard_config_errors(func):
+    """Report a refusal to overwrite an unparseable config as a result dict."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ConfigParseError as exc:
+            return {"status": "error", "message": str(exc)}
+
+    return wrapper
+
+
+def _strip_jsonc(text: str) -> str:
+    """Strip comments and trailing commas from JSONC, ignoring string contents.
+
+    Agent configs are often JSONC rather than strict JSON -- OpenCode's own
+    documented example uses both line comments and trailing commas.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if text[i + 1] == "*":
+                i += 2
+                while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                    i += 1
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _read_json_config(path: str) -> tuple[dict, bool]:
+    """Read a JSON or JSONC config file.
+
+    Returns the parsed config and whether JSONC handling was needed to read it.
+    The flag matters because writing back emits strict JSON, which drops any
+    comments the file had.
+
+    Returns an empty dict only when the file is genuinely absent or empty.
+    Raises ConfigParseError when the file exists but cannot be understood, so
+    that callers never overwrite a config they failed to read.
+    """
     try:
-        with open(path) as f:
-            return json.load(f) or {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {}, False
+    except (UnicodeDecodeError, OSError) as exc:
+        raise ConfigParseError(path) from exc
+    if not text.strip():
+        return {}, False
+    try:
+        return json.loads(text) or {}, False
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(text)) or {}, True
+    except json.JSONDecodeError as exc:
+        raise ConfigParseError(path) from exc
+
+
+def _read_json(path: str) -> dict:
+    """Read a JSON or JSONC config file, discarding the format detail."""
+    return _read_json_config(path)[0]
 
 
 def _write_json(path: str, data: dict) -> None:
-    """Write a dict as formatted JSON."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    """Write a dict as formatted JSON, keeping a .bak of any existing file.
+
+    Writing normalizes JSONC input to plain JSON, which drops the user's
+    comments and formatting; the backup is what makes that recoverable.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
 
@@ -110,6 +219,9 @@ OPENCODE_MCP_CONFIG = {
     "type": "local",
     "command": ["memory", "mcp"],
 }
+
+# Schema written when nothing indicates which OpenCode generation is in use.
+OPENCODE_DEFAULT_SCHEMA = 2
 
 
 def _install_mcp_servers(path: str) -> bool:
@@ -217,29 +329,107 @@ def _uninstall_toml_mcp(path: str) -> bool:
         return True
 
 
-def _install_opencode_mcp(path: str) -> bool:
-    """Install echovault into a JSON ``mcp`` key with OpenCode schema.
+def _detect_opencode_schema(data: dict) -> Optional[int]:
+    """Infer the OpenCode config generation from an existing config.
 
-    Returns True if the entry was added.
+    OpenCode 1 keyed servers directly off ``mcp``; OpenCode 2 nests them under
+    ``mcp.servers``. Returns 2 or 1, or None when the config shows neither.
     """
-    data = _read_json(path)
+    mcp = data.get("mcp")
+    if not isinstance(mcp, dict):
+        return None
+    if isinstance(mcp.get("servers"), dict):
+        return 2
+    for value in mcp.values():
+        if isinstance(value, dict) and {"command", "type", "url"} & set(value):
+            return 1
+    return None
+
+
+def _opencode_major_version() -> Optional[int]:
+    """Return the installed ``opencode`` major version, or None if unknown."""
+    executable = shutil.which("opencode")
+    if not executable:
+        return None
+    try:
+        proc = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.\d+", f"{proc.stdout or ''}{proc.stderr or ''}")
+    return int(match.group(1)) if match else None
+
+
+def _resolve_opencode_schema(data: dict, override: Optional[int] = None) -> int:
+    """Decide which OpenCode config schema to write.
+
+    An explicit choice wins; otherwise the shape of an existing config is the
+    most reliable signal, then the installed binary. A config being written
+    from scratch on a machine without OpenCode falls back to the current
+    generation, since that is what a new install will be.
+    """
+    if override is not None:
+        return override
+    detected = _detect_opencode_schema(data)
+    if detected is not None:
+        return detected
+    major = _opencode_major_version()
+    if major is not None:
+        return 2 if major >= 2 else 1
+    return OPENCODE_DEFAULT_SCHEMA
+
+
+def _opencode_container(mcp: dict, schema: int, *, create: bool) -> dict:
+    """Return the dict holding server entries for the given schema."""
+    if schema != 2:
+        return mcp
+    if create:
+        return mcp.setdefault("servers", {})
+    servers = mcp.get("servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def _install_opencode_mcp(
+    path: str, schema: Optional[int] = None
+) -> tuple[Optional[int], bool]:
+    """Install echovault into an OpenCode config.
+
+    Returns the schema generation written (None if already present) and whether
+    the config had to be read as JSONC, meaning the rewrite dropped comments.
+    """
+    data, was_jsonc = _read_json_config(path)
+    schema = _resolve_opencode_schema(data, schema)
     mcp = data.setdefault("mcp", {})
-    if "echovault" in mcp:
-        return False
-    mcp["echovault"] = OPENCODE_MCP_CONFIG
+    container = _opencode_container(mcp, schema, create=True)
+    if "echovault" in container:
+        return None, was_jsonc
+    container["echovault"] = dict(OPENCODE_MCP_CONFIG)
     _write_json(path, data)
-    return True
+    return schema, was_jsonc
 
 
 def _uninstall_opencode_mcp(path: str) -> bool:
-    """Remove echovault from a JSON ``mcp`` key.  Returns True if removed."""
+    """Remove echovault from an OpenCode config, in either schema."""
     if not os.path.exists(path):
         return False
     data = _read_json(path)
-    mcp = data.get("mcp", {})
-    if "echovault" not in mcp:
+    mcp = data.get("mcp")
+    if not isinstance(mcp, dict):
         return False
-    del mcp["echovault"]
+    removed = False
+    for schema in (2, 1):
+        container = _opencode_container(mcp, schema, create=False)
+        if "echovault" in container:
+            del container["echovault"]
+            removed = True
+    if not removed:
+        return False
+    if isinstance(mcp.get("servers"), dict) and not mcp["servers"]:
+        del mcp["servers"]
     if not mcp:
         del data["mcp"]
     if data:
@@ -451,6 +641,7 @@ def _get_claude_mcp_path(claude_home: str, project: bool) -> str:
     return os.path.join(os.path.expanduser("~"), ".claude.json")
 
 
+@_guard_config_errors
 def setup_claude_code(claude_home: str, *, project: bool = False) -> dict[str, str]:
     """Install EchoVault MCP server into Claude Code."""
     installed = []
@@ -485,6 +676,7 @@ def setup_claude_code(claude_home: str, *, project: bool = False) -> dict[str, s
     return {"status": "ok", "message": "Already installed"}
 
 
+@_guard_config_errors
 def setup_cursor(cursor_home: str) -> dict[str, str]:
     """Install EchoVault MCP server into Cursor mcp.json."""
     installed = []
@@ -580,6 +772,7 @@ Categories: `decision`, `bug`, `pattern`, `learning`, `context`.
 """
 
 
+@_guard_config_errors
 def setup_codex(codex_home: str) -> dict[str, str]:
     """Install EchoVault into Codex (AGENTS.md + MCP config).
 
@@ -626,6 +819,7 @@ def setup_codex(codex_home: str) -> dict[str, str]:
     return {"status": "ok", "message": msg}
 
 
+@_guard_config_errors
 def uninstall_claude_code(claude_home: str, *, project: bool = False) -> dict[str, str]:
     """Remove EchoVault from Claude Code."""
     removed = []
@@ -657,6 +851,7 @@ def uninstall_claude_code(claude_home: str, *, project: bool = False) -> dict[st
     return {"status": "ok", "message": "Nothing to remove"}
 
 
+@_guard_config_errors
 def uninstall_cursor(cursor_home: str) -> dict[str, str]:
     """Remove EchoVault from Cursor (MCP config + old hooks)."""
     removed = []
@@ -689,6 +884,7 @@ def uninstall_cursor(cursor_home: str) -> dict[str, str]:
     return {"status": "ok", "message": "Nothing to remove"}
 
 
+@_guard_config_errors
 def uninstall_codex(codex_home: str) -> dict[str, str]:
     """Remove EchoVault from Codex (AGENTS.md + config.toml)."""
     import re
@@ -742,15 +938,30 @@ def _get_opencode_mcp_path(project: bool) -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "opencode", "opencode.json")
 
 
-def setup_opencode(*, project: bool = False) -> dict[str, str]:
-    """Install EchoVault MCP server into OpenCode."""
+@_guard_config_errors
+def setup_opencode(
+    *, project: bool = False, opencode_version: Optional[int] = None
+) -> dict[str, str]:
+    """Install EchoVault MCP server into OpenCode.
+
+    The config schema differs between OpenCode 1 and 2; it is detected unless
+    ``opencode_version`` forces one.
+    """
     mcp_path = _get_opencode_mcp_path(project)
-    if _install_opencode_mcp(mcp_path):
-        scope = "opencode.json" if project else "~/.config/opencode/opencode.json"
-        return {"status": "ok", "message": f"Installed: mcp in {scope}"}
-    return {"status": "ok", "message": "Already installed"}
+    schema, was_jsonc = _install_opencode_mcp(mcp_path, opencode_version)
+    if schema is None:
+        return {"status": "ok", "message": "Already installed"}
+    scope = "opencode.json" if project else "~/.config/opencode/opencode.json"
+    message = f"Installed: mcp in {scope} (OpenCode {schema} schema)"
+    if was_jsonc:
+        message += (
+            f"\nNote: {scope} contained comments, which are not preserved when "
+            f"the file is rewritten. The original is kept at {scope}.bak."
+        )
+    return {"status": "ok", "message": message}
 
 
+@_guard_config_errors
 def uninstall_opencode(*, project: bool = False) -> dict[str, str]:
     """Remove EchoVault from OpenCode."""
     mcp_path = _get_opencode_mcp_path(project)
